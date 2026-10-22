@@ -3,6 +3,17 @@
 A minimal project to test OpenTelemetry tracing with Ray, exporting traces to a
 local Jaeger running in Docker.
 
+No OpenTelemetry Collector and no environment variables are needed for the
+default local setup: spans are sent straight from Ray's driver/worker processes
+to Jaeger's built-in OTLP receiver over HTTP.
+
+```
+driver + Ray workers ──OTLP/HTTP POST──▶ Jaeger all-in-one (Docker)
+                                        ├─ OTLP/HTTP receiver :4318
+                                        ├─ OTLP/gRPC receiver :4317
+                                        └─ Jaeger UI          :16686
+```
+
 ## Verified versions
 
 | Component                     | Version   |
@@ -52,14 +63,15 @@ driver into tasks/actors via a `_ray_trace_ctx` keyword argument.
 
 ## Prerequisites
 
-- Python 3.13.13 (any way you like; the commands below assume `uv` is available,
-  plain `venv` works too)
-- Docker. On macOS without Docker Desktop, [colima](https://github.com/abiosoft/colima)
-  provides a CLI-only Docker runtime:
-  ```bash
-  brew install colima docker
-  colima start --cpu 2 --memory 4
-  ```
+- **Python 3.13.13** (any way you like; the commands below assume `uv` is
+  available, plain `venv` works too)
+- **Docker** — any Docker runtime that exposes container ports on localhost:
+  - macOS with **Docker Desktop**: install it and start the app.
+  - macOS with **colima** (CLI-only, no GUI):
+    ```bash
+    brew install colima docker
+    colima start --cpu 2 --memory 4
+    ```
 
 ## Setup (one time)
 
@@ -75,30 +87,62 @@ uv pip install --python .venv/bin/python -r requirements.txt
 #   .venv/bin/pip install -r requirements.txt
 ```
 
-## Run
+## Start Jaeger
+
+The `jaegertracing/all-in-one` image bundles the Jaeger collector, query
+service, and UI in one container — and its collector has an **OTLP receiver
+built in**, so no separate OpenTelemetry Collector is required:
+
+- `16686` — Jaeger UI
+- `4317`  — OTLP/gRPC receiver
+- `4318`  — OTLP/HTTP receiver
 
 ```bash
-# 2. Start Jaeger (UI on 16686, OTLP/gRPC on 4317, OTLP/HTTP on 4318)
 docker run -d --name jaeger \
   -p 16686:16686 -p 4317:4317 -p 4318:4318 \
   jaegertracing/all-in-one:latest
+```
 
-# 3. Run the demo (from this directory, so Ray workers can import tracing_setup)
+Verify it's up:
+
+```bash
+docker ps --filter name=jaeger
+curl -s http://localhost:16686/api/services   # JSON with "data": [] means ready
+```
+
+Managing the container later:
+
+```bash
+docker stop jaeger     # pause
+docker start jaeger    # resume
+docker rm -f jaeger    # remove the container entirely
+```
+
+## Run the demo
+
+```bash
+# From this directory, so Ray workers can import tracing_setup
 PYTHONPATH="$PWD" .venv/bin/python main.py
 ```
 
-Open **http://localhost:16686** in a browser, select service `ray-otel-demo`
-from the dropdown, and click **Find Traces**.
+Then open **http://localhost:16686**, select service `ray-otel-demo` from the
+dropdown, and click **Find Traces**.
 
-## Configuration
+## How spans reach Jaeger (no env vars, no collector)
 
-| Env var                        | Default               | Purpose                          |
-| ------------------------------ | --------------------- | -------------------------------- |
-| `OTEL_EXPORTER_OTLP_ENDPOINT`  | `http://localhost:4318` | Base URL of the OTLP collector (SDK appends `/v1/traces`) |
-| `OTEL_SERVICE_NAME`            | `ray-otel-demo`       | Service name shown in Jaeger     |
+- The startup hook (`tracing_setup.py`) builds `OTLPSpanExporter()` **without
+  an endpoint**, so the OpenTelemetry SDK uses its built-in default
+  `http://localhost:4318/v1/traces` — Jaeger's OTLP/HTTP receiver. Nothing has
+  to be exported or configured for the local default to work.
+- Optional overrides (standard OpenTelemetry env vars):
 
-These are read inside the tracing hook, so they must be set in the environment
-the driver runs in (workers inherit them, and run the hook themselves).
+  | Env var                        | Default               | Purpose                          |
+  | ------------------------------ | --------------------- | -------------------------------- |
+  | `OTEL_EXPORTER_OTLP_ENDPOINT`  | `http://localhost:4318` | Base URL of the OTLP receiver (SDK appends `/v1/traces`) |
+  | `OTEL_SERVICE_NAME`            | `ray-otel-demo`       | Service name shown in Jaeger     |
+
+  They are read inside the tracing hook, so they must be set in the environment
+  the driver runs in (workers inherit them, and run the hook themselves).
 
 ## Files
 
