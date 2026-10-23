@@ -61,6 +61,34 @@ driver-root                          (driver, custom span)
 All spans land in a single trace — Ray propagates the trace context from the
 driver into tasks/actors via a `_ray_trace_ctx` keyword argument.
 
+It then runs the same workload again through `ray.util.multiprocessing.Pool`
+— Ray's drop-in replacement for the stdlib `multiprocessing.Pool`, backed by
+a small round-robin pool of `@ray.remote` actors instead of OS processes:
+
+```
+driver-root-pool                               (driver, custom span)
+└── PoolActor.run_batch ray.remote              (driver, PRODUCER span)
+    └── PoolActor.run_batch ray.remote_worker   (worker, CONSUMER span)
+        └── scale_item                          (worker, custom child span, one per batch item)
+```
+
+This traces automatically with no extra wiring: Ray's tracing hook
+instruments *every* `@ray.remote`-decorated class, including its own
+internal `PoolActor` (see `ray/actor.py:_make_actor`, which unconditionally
+calls `_inject_tracing_into_class` at decoration time — the actual
+enable/disable check happens lazily per-call against a global flag, so it
+doesn't matter that `PoolActor` was decorated long before `ray.init()` runs).
+`pool.map()`'s own `.remote()` call becomes the PRODUCER/CONSUMER span pair,
+and a plain `tracer.start_as_current_span(...)` inside the mapped function
+(`scale_item`) nests under the CONSUMER span exactly like `fetch_data.
+db_lookup` and `Processor.process.transform` do above.
+
+One wrinkle specific to `Pool`: `map()` batches multiple items into a single
+`run_batch.remote()` call (size controlled by `chunksize`), so one PRODUCER/
+CONSUMER span pair can cover several logical work items — that's why
+`scale_item` opens its own child span per item rather than relying on the
+CONSUMER span alone to identify individual items.
+
 ## Prerequisites
 
 - **Python 3.13.13** (any way you like; the commands below assume `uv` is
