@@ -234,3 +234,39 @@ job-1-task-actor                          [mac]   driver root
 | `cannot pickle '_thread.lock' object` | Module-level `tracer` captured in a remote function's closure | `trace.get_tracer(__name__)` inside each function |
 | Last spans of a run missing | `BatchSpanProcessor` and Ray never shuts the provider down | `SimpleSpanProcessor` for demo runs |
 | Traces appear under two services | Driver and workers got different `OTEL_SERVICE_NAME` | Set it in the driver env *and* via `runtime_env` env vars; keep them equal |
+
+## FAQ
+
+**Do worker nodes need `--tracing-startup-hook` on their `ray start`?**
+
+No — only the head takes the flag. The head stores the hook string in GCS,
+and every process that later connects (drivers, and workers on *all* nodes)
+reads it from there and runs it locally at its own connect time:
+
+```
+head: ray start --tracing-startup-hook=tracing_setup:setup_tracing
+        └─ writes "tracing_setup:setup_tracing" into GCS     (only the head writes GCS)
+
+worker node: ray start --address=...                          (no hook flag)
+        └─ each worker process, at connect time:
+             1. reads the hook string from GCS
+             2. imports tracing_setup and runs setup_tracing() in its own process
+```
+
+The flag is not just unnecessary on workers — it is a no-op there, because
+only the cluster-creating process writes that GCS key. What worker nodes
+*do* need is whatever the hook requires to actually run on them:
+
+- the hook module importable on that node (`PYTHONPATH` on the worker's
+  `ray start`), and
+- an exporter endpoint reachable from that node (`OTEL_EXPORTER_OTLP_ENDPOINT`
+  in the worker raylet's environment — a worker's `localhost` has no Jaeger).
+
+**Why set `OTEL_EXPORTER_OTLP_ENDPOINT` at `ray start` time instead of in the driver?**
+
+Because workers inherit the *raylet's* environment, not the driver's — the
+driver never spawns worker processes (the raylet does). The hook runs in
+each worker process and reads env vars from whatever environment that
+process was born with, so per-node settings like the hook module path and
+the exporter endpoint belong on that node's `ray start` command line, not
+in the driver's shell.
