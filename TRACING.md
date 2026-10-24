@@ -270,3 +270,40 @@ each worker process and reads env vars from whatever environment that
 process was born with, so per-node settings like the hook module path and
 the exporter endpoint belong on that node's `ray start` command line, not
 in the driver's shell.
+
+**The hook sets `service.name` — why doesn't `ray start` freeze it at cluster-start time? Does each job start new processes on the head?**
+
+`ray start --tracing-startup-hook=...` only stores the hook's *name* in GCS —
+the hook code does not execute at start time. The `service.name` in
+`tracing_setup.py` is an expression (`os.environ.get("OTEL_SERVICE_NAME", ...)`)
+evaluated later, inside each process, when it connects — against *that
+process's* environment:
+
+- The raylet/GCS processes from `ray start` never run the hook and produce
+  no spans; they only spawn workers on demand.
+- The driver's service comes from its own environment: `main.py job-1` sets
+  `OTEL_SERVICE_NAME` before `ray.init()`, and the hook reads it when it runs
+  in the driver process.
+- Head and Kali workers get the per-job name from the `runtime_env` env vars
+  carried by the task: the raylet applies them to the worker process *before*
+  the hook runs, so the hook sees `OTEL_SERVICE_NAME=ray-otel-job-1` in that
+  new process's environment. The `ray start` environment only supplies
+  defaults (`PYTHONPATH`, exporter endpoint) — never `OTEL_SERVICE_NAME`.
+
+And yes — each job starts new processes on every node it uses, the head
+included. Ray pools workers per runtime_env, so job-1's tasks spawn one set
+of worker processes and job-2's a separate set, each running the hook fresh
+at connect time. "Tracing is initialized once per process" is per *worker
+process*, not per node or per cluster:
+
+```
+ray start --head --tracing-startup-hook=...   ← stores "tracing_setup:setup_tracing" in GCS only
+main.py job-1 (new driver process on the Mac)
+  └─ hook runs in the driver, reads its own env  →  service ray-otel-job-1
+task arrives with runtime_env env_vars {OTEL_SERVICE_NAME: ray-otel-job-1}
+  └─ head raylet spawns a NEW worker process with that env → hook → ray-otel-job-1
+  └─ kali raylet spawns a NEW worker process with that env → hook → ray-otel-job-1
+```
+
+A job that did *not* carry the env var would get workers under the default
+`ray-otel-demo` — the "traces appear under two services" row above.
