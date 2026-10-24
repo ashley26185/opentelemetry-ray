@@ -19,6 +19,7 @@ processing could drop the last spans of a short demo run.
 """
 
 import os
+import socket
 
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -38,10 +39,16 @@ def setup_tracing() -> None:
     exporter-otlp >= 1.36, passing ``endpoint=`` explicitly uses the URL
     as-is, so the signal path ``/v1/traces`` would have to be included.)
     """
+    # ``host.name`` makes every span attributable to the node it was produced
+    # on (e.g. ``kali`` vs the Mac's hostname) in Jaeger's process tags.
     provider = TracerProvider(
         resource=Resource.create(
-            {"service.name": os.environ.get("OTEL_SERVICE_NAME", "ray-otel-demo")}
+            {
+                "service.name": os.environ.get("OTEL_SERVICE_NAME", "ray-otel-demo"),
+                "host.name": socket.gethostname(),
+            }
         )
     )
     provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter()))
     trace.set_tracer_provider(provider)
+

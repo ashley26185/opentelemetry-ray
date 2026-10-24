@@ -45,34 +45,39 @@ driver + Ray workers ──OTLP/HTTP POST──▶ Jaeger all-in-one (Docker)
 
 ## What the demo does
 
-`main.py` starts a local Ray cluster and runs remote tasks and an actor:
+`main.py` submits two jobs. With no cluster running it starts a local
+single-node one; with a cluster up (see below) it connects to it and pins
+each job's work to both nodes via the `head`/`kali` resources.
+
+Job 1 — task/actor pipeline (root span `job-1-task-actor`):
 
 ```
-driver-root                          (driver, custom span)
-├── fetch_data ray.remote            (driver, Ray PRODUCER span)
-│   └── fetch_data ray.remote_worker (worker, Ray CONSUMER span)
-│       └── fetch_data.db_lookup     (worker, custom child span)
-├── … 4 more fetch_data tasks …
-└── Processor.process ray.remote     (driver, PRODUCER)
+job-1-task-actor                      (driver, custom span)
+├── fetch_data ray.remote             (driver, Ray PRODUCER span — 3 tasks pinned to head, 3 to kali)
+│   └── fetch_data ray.remote_worker  (worker, Ray CONSUMER span)
+│       └── fetch_data.db_lookup      (worker, custom child span)
+└── Processor.process ray.remote      (driver, PRODUCER — actor pinned to kali)
     └── Processor.process ray.remote_worker   (worker, CONSUMER)
         └── Processor.process.transform       (worker, custom child)
+```
+
+Job 2 — `ray.util.multiprocessing.Pool` pipeline (root span `job-2-pool`):
+one Pool pinned to the head and one to kali — Ray's drop-in replacement for
+the stdlib `multiprocessing.Pool`, backed by a small round-robin pool of
+`@ray.remote` actors instead of OS processes:
+
+```
+job-2-pool                            (driver, custom span)
+├── PoolActor.run_batch ray.remote    (driver, PRODUCER — Pool pinned to head)
+│   └── PoolActor.run_batch ray.remote_worker   (worker, CONSUMER)
+│       └── scale_item                (worker, custom child, one per batch item)
+└── … second Pool on kali …
 ```
 
 All spans land in a single trace — Ray propagates the trace context from the
 driver into tasks/actors via a `_ray_trace_ctx` keyword argument.
 
-It then runs the same workload again through `ray.util.multiprocessing.Pool`
-— Ray's drop-in replacement for the stdlib `multiprocessing.Pool`, backed by
-a small round-robin pool of `@ray.remote` actors instead of OS processes:
-
-```
-driver-root-pool                               (driver, custom span)
-└── PoolActor.run_batch ray.remote              (driver, PRODUCER span)
-    └── PoolActor.run_batch ray.remote_worker   (worker, CONSUMER span)
-        └── scale_item                          (worker, custom child span, one per batch item)
-```
-
-This traces automatically with no extra wiring: Ray's tracing hook
+The pool path traces automatically with no extra wiring: Ray's tracing hook
 instruments *every* `@ray.remote`-decorated class, including its own
 internal `PoolActor` (see `ray/actor.py:_make_actor`, which unconditionally
 calls `_inject_tracing_into_class` at decoration time — the actual
@@ -153,8 +158,93 @@ docker rm -f jaeger    # remove the container entirely
 PYTHONPATH="$PWD" .venv/bin/python main.py
 ```
 
+For per-job `service.name`s, run each job as its own driver process
+(`set_tracer_provider` is once-per-process, so one process cannot switch
+services between jobs):
+
+```bash
+PYTHONPATH="$PWD" .venv/bin/python main.py job-1   # all spans: ray-otel-job-1
+PYTHONPATH="$PWD" .venv/bin/python main.py job-2   # all spans: ray-otel-job-2
+```
+
+With a cluster running (see next section), the same command connects to it
+instead of starting a local one.
+
 Then open **http://localhost:16686**, select service `ray-otel-demo` from the
 dropdown, and click **Find Traces**.
+
+## Run on the two-node cluster (Mac head + Kali VM worker)
+
+The same `main.py` also runs against a Ray cluster spanning the Mac (head)
+and the Kali VM (worker), pinning half of each job's work to each node so
+every trace contains spans from both. The Kali VM sits behind UTM's shared
+network (192.168.64.x) but can reach the Mac's main IP; the head must
+advertise an address both the VM workers and Mac drivers can reach.
+
+Start the head (Mac, from the project directory so workers can import
+`tracing_setup`):
+
+```bash
+PYTHONPATH="$PWD" .venv/bin/ray start --head --port=6379 \
+  --node-ip-address=10.0.0.14 --resources='{"head": 1}' \
+  --tracing-startup-hook=tracing_setup:setup_tracing --disable-usage-stats
+```
+
+Start the worker (Kali VM; `~/.ssh/config` maps `Host kali` to
+`ashley@192.168.64.3`, the VM's UTM shared-network address). The VM's venv
+(`~/ray-venv`, Python 3.13.13 + Ray 2.47.1 + the pinned OpenTelemetry
+packages) is built once with:
+
+```bash
+ssh kali '~/.local/bin/uv venv --seed --python 3.13.13 ~/ray-venv'
+ssh kali 'mkdir -p ~/ray-shared'
+scp requirements.txt tracing_setup.py kali:~/ray-shared/
+ssh kali '~/ray-venv/bin/pip install -r ~/ray-shared/requirements.txt'
+```
+
+Then start the worker raylet with the hook module on `PYTHONPATH` and the
+OTLP exporter pointed at the Mac's Jaeger (VM-side `localhost` would not
+find it — Jaeger runs on the Mac):
+
+```bash
+ssh kali 'PYTHONPATH=/home/ashley/ray-shared \
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://10.0.0.14:4318 \
+  nohup ~/ray-venv/bin/ray start --address=10.0.0.14:6379 \
+  --resources='\''{"kali": 1}'\'' --disable-usage-stats >/tmp/ray-worker.log 2>&1 &'
+```
+
+Notes:
+
+- **Exact version matching.** Ray requires the identical Ray AND Python
+  version (patch level included) on every node — 2.47.1 / 3.13.13 here.
+- **Tracing hook lives in GCS.** `ray start --head --tracing-startup-hook`
+  stores the hook string in GCS, and every process that connects (workers on
+  both nodes *and* the driver) reads and runs it from there. A connecting
+  driver's `_tracing_startup_hook` kwarg is **ignored** against an existing
+  cluster — it only matters in single-node mode, where `ray.init()` creates
+  the head itself. Without the flag on `ray start`, the demo runs fine but
+  produces no spans.
+- **Node resources.** `--resources='{"head": 1}'` and `{"kali": 1}` give the
+  jobs stable labels to pin work by; `main.py` falls back to unpinned
+  scheduling when they are absent.
+- **Env vars on the VM.** Workers inherit the raylet's environment, so the
+  `PYTHONPATH` and `OTEL_EXPORTER_OTLP_ENDPOINT` set at `ray start` time are
+  what make the tracing hook importable and its exporter reach Jaeger.
+- **Driver node IP.** On multi-homed hosts the driver's auto-detected IP
+  must match a node registered in GCS. It normally does (both are the Mac's
+  primary IP); if not, set `RAY_NODE_IP_ADDRESS` for the driver.
+
+Run both jobs and validate:
+
+```bash
+PYTHONPATH="$PWD" .venv/bin/python main.py job-1   # all spans: ray-otel-job-1
+PYTHONPATH="$PWD" .venv/bin/python main.py job-2   # all spans: ray-otel-job-2
+.venv/bin/python validate_traces.py
+```
+
+`validate_traces.py` asks Jaeger for the latest `job-1-task-actor` and
+`job-2-pool` traces and verifies each contains spans whose `host.name`
+process tag is both the Mac's hostname and `kali`.
 
 ## How spans reach Jaeger (no env vars, no collector)
 
@@ -172,13 +262,36 @@ dropdown, and click **Find Traces**.
   They are read inside the tracing hook, so they must be set in the environment
   the driver runs in (workers inherit them, and run the hook themselves).
 
+**Service name vs job identity.** By default every span carries
+`service.name = ray-otel-demo` and the jobs are told apart by their root
+span names. In the per-job modes (`main.py job-1` / `main.py job-2`), the
+whole trace — driver, head workers, Kali workers — lands under one service:
+
+- **Driver**: the script sets `OTEL_SERVICE_NAME` before `ray.init()`, so
+  the tracing hook names the driver's provider.
+- **Workers**: every remote call carries the same name in a `runtime_env`
+  env var, which Ray applies to worker processes *before* the hook runs
+  (verified against Ray 2.47.1). Ray also pools workers per runtime env, so
+  the two jobs never share worker processes.
+
+This is why the jobs are separate driver processes rather than one script
+switching names: OpenTelemetry's `set_tracer_provider` is once-per-process
+by design, so a mid-process swap is impossible.
+
 ## Files
 
 - `tracing_setup.py` — the OpenTelemetry startup hook
   (`tracing_setup:setup_tracing`). Installs the global `TracerProvider` with an
-  OTLP/HTTP exporter. Runs once per process (driver + every worker).
-- `main.py` — the demo driver: `ray.init(_tracing_startup_hook=...)`, a custom
-  root span, traced remote tasks and an actor.
+  OTLP/HTTP exporter and a resource carrying `service.name` + `host.name` (the
+  latter is what `validate_traces.py` uses to attribute spans to nodes). Runs
+  once per process (driver + every worker).
+- `main.py` — the demo driver: `ray.init(_tracing_startup_hook=...)`, two
+  jobs (a task/actor pipeline and a `Pool` pipeline), each pinning work to
+  the head and Kali nodes when the `head`/`kali` resources exist.
+- `validate_traces.py` — queries the Jaeger API and checks both jobs' traces
+  contain spans from the head and from Kali.
+- `TRACING.md` — the full guide to tracing a distributed Ray cluster: the
+  mechanism, per-node setup, per-job service names, and troubleshooting.
 - `requirements.txt` — pinned dependencies.
 
 ## Troubleshooting
